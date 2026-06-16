@@ -541,7 +541,7 @@ let db = (() => {
   try { const d=localStorage.getItem(STORE); return d?JSON.parse(d):{batches:[],students:[],classes:[],payments:[],meta:{}}; }
   catch(e){ return {batches:[],students:[],classes:[],payments:[],meta:{}}; }
 })();
-let sheetUrl = localStorage.getItem('laasyaSheet')||'';
+let sheetUrl = localStorage.getItem('laasyaSheet')||'https://script.google.com/macros/s/AKfycbwqDZpOFzDTIvcp1ILnZ50vVaoFe8y1xfah6L5N8GxErpEZKWBEViM9Odha8ebSpK-u/exec';
 
 function saveDB(){
   if(!db.meta) db.meta={};
