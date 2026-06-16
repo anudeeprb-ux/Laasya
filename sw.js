@@ -1,6 +1,6 @@
 // Laasya School of Dance - Service Worker
 // Version bump this string any time you update the app
-const CACHE_NAME = 'laasya-v1';
+const CACHE_NAME = 'laasya-v3';
 
 // All files the app needs to work offline
 const CACHE_FILES = [

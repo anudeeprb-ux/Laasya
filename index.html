@@ -345,7 +345,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <div><div class="set-lbl">Status</div><div class="set-sub" id="syncStat">—</div></div>
       <button class="set-btn" onclick="syncNow()">Push now</button>
     </div>
-    <button class="full-btn outline" style="margin-top:8px" onclick="importStudentsFromSheet()">⬇ Import Students from Sheet</button>
+    <button class="full-btn dark" style="margin-top:8px" onclick="confirmForcePush()">⬆ Force push to Sheet (overwrite)</button>
+    <button class="full-btn outline" onclick="importStudentsFromSheet()">⬇ Import Students from Sheet</button>
     <button class="full-btn outline" onclick="openGuide()">📖 Setup guide</button>
   </div>
   <div class="settings-sec">
@@ -1600,10 +1601,15 @@ function renderSettings(){
 }
 
 function saveSheetUrl(){ sheetUrl=document.getElementById('sheetUrlInput').value.trim(); localStorage.setItem('laasyaSheet',sheetUrl); closeModal('modalSheetSetup'); renderSettings(); toast('Saved ✓'); }
-async function syncNow(){
+async function forceSyncNow(){
+  // Bypasses empty-check - use when you know local is correct and want to overwrite Sheet
+  await syncNow(true);
+}
+
+async function syncNow(force){
   if(!sheetUrl) return;
   // Safety: never push if local is empty (could wipe Sheet data)
-  if(!isLocalNonEmpty()){
+  if(!force && !isLocalNonEmpty()){
     console.log('Sync skipped: local data is empty, not pushing');
     return;
   }
@@ -1690,6 +1696,16 @@ async function importStudentsFromSheet(){
   }
 }
 
+function confirmForcePush(){
+  if(!isLocalNonEmpty()){
+    toast('No local data to push. Restore from backup first.');
+    return;
+  }
+  if(!confirm('This will overwrite everything in your Google Sheet with the data currently on this device. Are you sure?')) return;
+  forceSyncNow();
+  toast('Force pushing to Sheet...');
+}
+
 function openSheetSetup(){
   document.getElementById('sheetUrlInput').value=sheetUrl||'';
   document.getElementById('modalSheetSetup').classList.add('open');
@@ -1706,6 +1722,7 @@ function copyScript(){
   s+="    var b=JSON.parse(decodeURIComponent(e.parameter.payload));\n";
   s+="    if(b.action==='sync') return syncData(b.data);\n";
   s+="    if(b.action==='pull') return pullData();\n";
+  s+="    if(b.action==='pullSheets') return pullFromSheets();\n";
   s+="    if(b.action==='getStudents') return getStudentsData();\n";
   s+="    return out({status:'error',message:'Unknown action'});\n";
   s+="  }catch(err){ return out({status:'error',message:err.message}); }\n";
@@ -1715,6 +1732,7 @@ function copyScript(){
   s+="    var b=JSON.parse(e.postData.contents);\n";
   s+="    if(b.action==='sync') return syncData(b.data);\n";
   s+="    if(b.action==='pull') return pullData();\n";
+  s+="    if(b.action==='pullSheets') return pullFromSheets();\n";
   s+="    if(b.action==='getStudents') return getStudentsData();\n";
   s+="    return out({status:'error',message:'Unknown'});\n";
   s+="  }catch(err){ return out({status:'error',message:err.message}); }\n";
@@ -1748,6 +1766,83 @@ function copyScript(){
   s+="    });\n";
   s+="  }\n";
   s+="  return out({status:'ok',rows:rows});\n";
+  s+="}\n\n";
+  s+="// Read directly from Batches + Students tabs (human-readable) and rebuild db\n";
+  s+="function pullFromSheets(){\n";
+  s+="  var ss=SpreadsheetApp.getActiveSpreadsheet();\n";
+  s+="  var data={batches:[],students:[],classes:[],payments:[],meta:{lastSync:new Date().toISOString()}};\n";
+  s+="  // Read Batches tab\n";
+  s+="  var bsh=ss.getSheetByName('Batches');\n";
+  s+="  if(bsh&&bsh.getLastRow()>1){\n";
+  s+="    var bdata=bsh.getDataRange().getValues();\n";
+  s+="    var bh=bdata[0]; // header row\n";
+  s+="    var biId=bh.indexOf('Batch ID'), biName=bh.indexOf('Batch Name');\n";
+  s+="    var biTime=bh.indexOf('Timing'), biFee=bh.indexOf('Monthly Fee (Rs)');\n";
+  s+="    var biColor=bh.indexOf('Color'), biNotes=bh.indexOf('Notes');\n";
+  s+="    for(var i=1;i<bdata.length;i++){\n";
+  s+="      var row=bdata[i];\n";
+  s+="      var bid=biId>=0?String(row[biId]||'').trim():'';\n";
+  s+="      var bname=biName>=0?String(row[biName]||'').trim():'';\n";
+  s+="      if(!bid||!bname) continue;\n";
+  s+="      data.batches.push({\n";
+  s+="        id:bid, name:bname,\n";
+  s+="        time:biTime>=0?String(row[biTime]||''):'',\n";
+  s+="        fee:biFee>=0?Number(row[biFee])||0:0,\n";
+  s+="        color:biColor>=0?String(row[biColor]||''):'#333',\n";
+  s+="        notes:biNotes>=0?String(row[biNotes]||''):''\n";
+  s+="      });\n";
+  s+="    }\n";
+  s+="  }\n";
+  s+="  // Read Students tab\n";
+  s+="  var ssh=ss.getSheetByName('Students');\n";
+  s+="  if(ssh&&ssh.getLastRow()>1){\n";
+  s+="    var sdata=ssh.getDataRange().getValues();\n";
+  s+="    var sh=sdata[0];\n";
+  s+="    var siId=sh.indexOf('Student ID'), siName=sh.indexOf('Student Name');\n";
+  s+="    var siPhone=sh.indexOf('Phone'), siDob=sh.indexOf('Date of Birth');\n";
+  s+="    var siBatch=sh.indexOf('Batch ID'), siNotes=sh.indexOf('Notes');\n";
+  s+="    var siArch=sh.indexOf('Archived');\n";
+  s+="    for(var i=1;i<sdata.length;i++){\n";
+  s+="      var row=sdata[i];\n";
+  s+="      var sid=siId>=0?String(row[siId]||'').trim():'';\n";
+  s+="      var sname=siName>=0?String(row[siName]||'').trim():'';\n";
+  s+="      if(!sid||!sname) continue;\n";
+  s+="      data.students.push({\n";
+  s+="        id:sid, name:sname,\n";
+  s+="        phone:siPhone>=0?String(row[siPhone]||''):'',\n";
+  s+="        dob:siDob>=0?formatDobValue(row[siDob]):'',\n";
+  s+="        batchId:siBatch>=0?String(row[siBatch]||'').trim():'',\n";
+  s+="        notes:siNotes>=0?String(row[siNotes]||''):'',\n";
+  s+="        archived:/^(yes|true|1)$/i.test(String(row[siArch]||''))\n";
+  s+="      });\n";
+  s+="    }\n";
+  s+="  }\n";
+  s+="  // Read Payments tab\n";
+  s+="  var psh=ss.getSheetByName('Payments');\n";
+  s+="  if(psh&&psh.getLastRow()>1){\n";
+  s+="    var pdata=psh.getDataRange().getValues();\n";
+  s+="    var ph=pdata[0];\n";
+  s+="    var piId=ph.indexOf('Payment ID'), piSid=ph.indexOf('Student ID');\n";
+  s+="    var piMo=ph.indexOf('Month'), piAmt=ph.indexOf('Amount (Rs)');\n";
+  s+="    var piDate=ph.indexOf('Date'), piMode=ph.indexOf('Mode');\n";
+  s+="    for(var i=1;i<pdata.length;i++){\n";
+  s+="      var row=pdata[i];\n";
+  s+="      var pid=piId>=0?String(row[piId]||'').trim():'';\n";
+  s+="      var psid=piSid>=0?String(row[piSid]||'').trim():'';\n";
+  s+="      if(!pid||!psid) continue;\n";
+  s+="      data.payments.push({\n";
+  s+="        id:pid, studentId:psid,\n";
+  s+="        month:piMo>=0?String(row[piMo]||''):'',\n";
+  s+="        amount:piAmt>=0?Number(row[piAmt])||0:0,\n";
+  s+="        date:piDate>=0?String(row[piDate]||''):'',\n";
+  s+="        note:piMode>=0?String(row[piMode]||''):''\n";
+  s+="      });\n";
+  s+="    }\n";
+  s+="  }\n";
+  s+="  if(data.batches.length===0&&data.students.length===0){\n";
+  s+="    return out({status:'ok',data:data,message:'Sheets appear empty'});\n";
+  s+="  }\n";
+  s+="  return out({status:'ok',data:data});\n";
   s+="}\n\n";
   s+="function formatDobValue(v){\n";
   s+="  if(!v) return '';\n";
@@ -1955,10 +2050,11 @@ async function initApp(){
     if(btn){ btn.style.display='flex'; btn.innerHTML='↻ Loading...'; btn.className='hbtn syncing'; }
     toast('First launch - loading from Google Sheets...');
     try{
+      // Step 1: Try reading directly from Batches + Students + Classes + Payments tabs
       const pullUrl=sheetUrl+(sheetUrl.includes('?')?'&':'?')+
-        'payload='+encodeURIComponent(JSON.stringify({action:'pull'}));
+        'payload='+encodeURIComponent(JSON.stringify({action:'pullSheets'}));
       const controller=new AbortController();
-      setTimeout(()=>controller.abort(), 10000);
+      setTimeout(()=>controller.abort(),10000);
       const r=await fetch(pullUrl,{method:'GET',signal:controller.signal});
       if(r.ok){
         const j=await r.json();
@@ -1967,18 +2063,38 @@ async function initApp(){
           if(!db.meta) db.meta={};
           db.meta.lastSync=new Date().toISOString();
           localStorage.setItem(STORE,JSON.stringify(db));
-          navigate('Batches');
+          navigate('Batches'); updateHeader();
           if(btn){ btn.innerHTML='✓ Loaded'; btn.className='hbtn synced';
             setTimeout(()=>{ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; },3000); }
           toast('Data loaded from Google Sheets ✓');
         } else {
-          if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
-          toast('Sheet is empty or not reachable');
+          // Step 2: Fall back to _json snapshot
+          const pullUrl2=sheetUrl+(sheetUrl.includes('?')?'&':'?')+
+            'payload='+encodeURIComponent(JSON.stringify({action:'pull'}));
+          const r2=await fetch(pullUrl2,{method:'GET'});
+          if(r2.ok){
+            const j2=await r2.json();
+            if(j2.status==='ok'&&j2.data&&j2.data.batches&&j2.data.batches.length>0){
+              db=j2.data;
+              if(!db.meta) db.meta={};
+              db.meta.lastSync=new Date().toISOString();
+              localStorage.setItem(STORE,JSON.stringify(db));
+              navigate('Batches'); updateHeader();
+              if(btn){ btn.innerHTML='✓ Loaded'; btn.className='hbtn synced';
+                setTimeout(()=>{ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; },3000); }
+              toast('Data loaded from Google Sheets ✓');
+            } else {
+              if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
+              toast('Sheet has no data yet - add batches to get started');
+            }
+          } else {
+            if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
+          }
         }
       }
     }catch(e){
-      // Offline or Sheet unreachable - user starts with empty app, will auto-push once they add data
       if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
+      toast('Offline - add data locally, will sync when online');
     }
     return;
   }
