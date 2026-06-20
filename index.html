@@ -551,10 +551,10 @@ function saveDB(){
   db.meta.localModified = new Date().toISOString();
   localStorage.setItem(STORE, JSON.stringify(db));
   if(!_syncing){
-    updateSyncBtn(false);
+    // Only show orange if not already syncing or recently synced
     if(sheetUrl && isLocalNonEmpty()){
       clearTimeout(saveDB._t);
-      saveDB._t = setTimeout(syncNow, 5000); // 5s debounce
+      saveDB._t = setTimeout(syncNow, 5000); // 5s debounce - sync will happen, no need to alarm user
     }
   }
 }
@@ -569,9 +569,19 @@ function updateSyncBtn(synced){
   const btn=document.getElementById('topSyncBtn');
   if(!btn||!sheetUrl) return;
   btn.style.display='flex';
-  if(synced===null){ btn.className='hbtn syncing'; btn.innerHTML='<span class="spin-ico">↻</span> Syncing'; }
-  else if(synced){ btn.className='hbtn synced'; btn.innerHTML='✓ Synced'; setTimeout(function(){btn.className='hbtn';btn.innerHTML='↑↓ Sync';},3000); }
-  else { btn.className='hbtn unsynced'; btn.innerHTML='● Sync'; }
+  if(synced===null){
+    // Currently syncing
+    btn.className='hbtn syncing'; btn.innerHTML='↻ Syncing';
+  } else if(synced===true){
+    // Just succeeded - show green briefly then go neutral
+    btn.className='hbtn synced'; btn.innerHTML='✓ Synced';
+    setTimeout(function(){
+      btn.className='hbtn'; btn.innerHTML='↑↓ Sync';
+    },3000);
+  } else {
+    // Unsynced changes (offline edits)
+    btn.className='hbtn unsynced'; btn.innerHTML='● Sync';
+  }
 }
 function genId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,5); }
 function genStudentId(){
@@ -2126,13 +2136,18 @@ async function initApp(){
   }
 
   // Local has data - check if there are unsynced offline changes
-  if(isLocalNonEmpty() && sheetUrl && db.meta && db.meta.localModified){
-    // Show a sync button indicator but don't auto-push on startup
-    // User can tap Sync button to push their offline changes
-    updateSyncBtn(false);
-    const el=document.getElementById('syncStat');
-    if(el) el.textContent='Offline changes pending - tap Sync to push';
-    toast('You have unsynced changes - tap ↑↓ Sync to push to Sheet');
+  if(isLocalNonEmpty() && sheetUrl){
+    const btn=document.getElementById('topSyncBtn');
+    if(db.meta && db.meta.localModified){
+      // Genuine offline changes - show orange
+      if(btn){ btn.className='hbtn unsynced'; btn.innerHTML='● Sync'; }
+      const el=document.getElementById('syncStat');
+      if(el) el.textContent='Offline changes pending - tap Sync to push';
+      toast('You have unsynced changes - tap Sync to push to Sheet');
+    } else {
+      // Already in sync - show neutral button
+      if(btn){ btn.className='hbtn'; btn.innerHTML='↑↓ Sync'; }
+    }
   }
 }
 
