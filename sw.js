@@ -1,6 +1,6 @@
 // Laasya School of Dance - Service Worker
-const CACHE_NAME = 'laasya-v5';
-const BASE = '/laasya';
+const CACHE_NAME = 'laasya-v6';
+const BASE = '/Laasya';
 
 const CACHE_FILES = [
   BASE + '/',
