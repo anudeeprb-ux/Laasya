@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="Laasya">
 <meta name="theme-color" content="#000000">
-<link rel="manifest" href="manifest.json">
+<link rel="manifest" href="./manifest.json">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" type="image/png" href="favicon.png">
 <title>Laasya School of Dance</title>
@@ -2109,7 +2109,7 @@ if('serviceWorker' in navigator){
 
 // Register service worker
 if('serviceWorker' in navigator){
-  navigator.serviceWorker.register('/Laasya/sw.js').then(reg=>{
+  navigator.serviceWorker.register('./sw.js').then(reg=>{
     // Check for updates on load
     reg.addEventListener('updatefound',()=>{
       const newWorker=reg.installing;

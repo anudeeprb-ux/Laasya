@@ -1,17 +1,16 @@
-// Laasya School of Dance - Service Worker
-const CACHE_NAME = 'laasya-v6';
-const BASE = '/Laasya';
+// Laasya School of Dance - Service Worker v7
+const CACHE_NAME = 'laasya-v7';
 
+// Use relative URLs - works regardless of repo name or case
 const CACHE_FILES = [
-  BASE + '/',
-  BASE + '/index.html',
-  BASE + '/manifest.json',
-  BASE + '/icon-192.png',
-  BASE + '/icon-512.png',
-  BASE + '/favicon.png'
+  './',
+  './index.html',
+  './manifest.json',
+  './icon-192.png',
+  './icon-512.png',
+  './favicon.png'
 ];
 
-// Install: cache all app files
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME)
@@ -20,7 +19,6 @@ self.addEventListener('install', event => {
   );
 });
 
-// Activate: remove old caches
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
@@ -31,11 +29,10 @@ self.addEventListener('activate', event => {
   );
 });
 
-// Fetch: serve from cache, fall back to network
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
-  // Never intercept Google Apps Script requests
+  // Never intercept Google Apps Script
   if (url.hostname.includes('script.google.com')) {
     event.respondWith(
       fetch(event.request).catch(() =>
@@ -47,7 +44,7 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // App files: cache first, network fallback
+  // Cache first, network fallback
   event.respondWith(
     caches.match(event.request).then(cached => {
       if (cached) return cached;
@@ -57,12 +54,11 @@ self.addEventListener('fetch', event => {
           caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
         }
         return response;
-      }).catch(() => caches.match(BASE + '/index.html'));
+      }).catch(() => caches.match('./index.html'));
     })
   );
 });
 
-// Background sync: push offline changes when back online
 self.addEventListener('sync', event => {
   if (event.tag === 'laasya-sync') {
     event.waitUntil(
