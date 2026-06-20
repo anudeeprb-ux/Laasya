@@ -2098,29 +2098,24 @@ async function initApp(){
   }
 }
 
-// Listen for service worker sync trigger (back online after offline edits)
-if('serviceWorker' in navigator){
-  navigator.serviceWorker.addEventListener('message', event=>{
-    if(event.data && event.data.type==='SYNC_NOW' && isLocalNonEmpty()){
-      syncNow();
-    }
-  });
-}
 
-// Register service worker
+// ── Service Worker ────────────────────────────────────────────────────────
 if('serviceWorker' in navigator){
   navigator.serviceWorker.register('./sw.js').then(reg=>{
-    // Check for updates on load
     reg.addEventListener('updatefound',()=>{
-      const newWorker=reg.installing;
-      newWorker.addEventListener('statechange',()=>{
-        if(newWorker.state==='installed'&&navigator.serviceWorker.controller){
-          toast('App updated - changes will apply next time you open it');
+      const nw=reg.installing;
+      nw.addEventListener('statechange',()=>{
+        if(nw.state==='installed'&&navigator.serviceWorker.controller){
+          toast('App updated - reopen to get latest version');
         }
       });
     });
-  }).catch(e=>console.log('SW registration failed:',e));
+  }).catch(e=>console.log('SW failed:',e));
+  navigator.serviceWorker.addEventListener('message', event=>{
+    if(event.data&&event.data.type==='SYNC_NOW'&&isLocalNonEmpty()) syncNow();
+  });
 }
+
 
 initApp();
 </script>
