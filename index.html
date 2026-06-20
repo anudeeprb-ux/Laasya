@@ -1602,38 +1602,66 @@ function renderSettings(){
 
 function saveSheetUrl(){ sheetUrl=document.getElementById('sheetUrlInput').value.trim(); localStorage.setItem('laasyaSheet',sheetUrl); closeModal('modalSheetSetup'); renderSettings(); toast('Saved ✓'); }
 async function forceSyncNow(){
-  // Bypasses empty-check - use when you know local is correct and want to overwrite Sheet
   await syncNow(true);
+}
+
+// Helper: GET request to Sheet (for small reads - pull, pullSheets)
+async function sheetGet(action, timeoutMs=10000){
+  const url=sheetUrl+(sheetUrl.includes('?')?'&':'?')+
+    'payload='+encodeURIComponent(JSON.stringify({action}));
+  const ctrl=new AbortController();
+  const tid=setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const r=await fetch(url,{method:'GET',signal:ctrl.signal});
+    clearTimeout(tid);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }catch(e){ clearTimeout(tid); throw e; }
+}
+
+// Helper: POST request to Sheet (for large writes - sync)
+async function sheetPost(action, data, timeoutMs=15000){
+  const ctrl=new AbortController();
+  const tid=setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const r=await fetch(sheetUrl,{
+      method:'POST',
+      body:JSON.stringify({action, data}),
+      headers:{'Content-Type':'text/plain'}, // text/plain avoids CORS preflight
+      signal:ctrl.signal
+    });
+    clearTimeout(tid);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }catch(e){ clearTimeout(tid); throw e; }
 }
 
 async function syncNow(force){
   if(!sheetUrl) return;
-  // Safety: never push if local is empty (could wipe Sheet data)
   if(!force && !isLocalNonEmpty()){
-    console.log('Sync skipped: local data is empty, not pushing');
+    console.log('Sync skipped: local is empty');
     return;
   }
   const el=document.getElementById('syncStat');
   updateSyncBtn(null);
   if(el) el.textContent='Syncing...';
   try{
-    const payload=encodeURIComponent(JSON.stringify({action:'sync',data:db}));
-    const url=sheetUrl+(sheetUrl.includes('?')?'&':'?')+'payload='+payload;
-    await fetch(url,{method:'GET',mode:'no-cors'});
+    // Use POST for large data - avoids URL length limits
+    await sheetPost('sync', db);
     if(!db.meta) db.meta={};
     db.meta.lastSync=new Date().toISOString();
-    delete db.meta.localModified; // clear dirty flag after successful sync
+    delete db.meta.localModified;
     localStorage.setItem(STORE,JSON.stringify(db));
     const t=new Date().toLocaleTimeString('en-IN');
-    if(el) el.textContent='Last pushed '+t;
+    if(el) el.textContent='Pushed at '+t;
     updateSyncBtn(true);
     if(document.getElementById('setSync')) renderSettings();
+    toast('Synced to Google Sheets ✓');
   }catch(e){
-    if(el) el.textContent='Failed - will retry';
+    if(el) el.textContent='Sync failed - will retry when online';
     updateSyncBtn(false);
-    // Queue for background sync when back online
     if('serviceWorker' in navigator && 'SyncManager' in window){
-      navigator.serviceWorker.ready.then(sw => sw.sync.register('laasya-sync'));
+      navigator.serviceWorker.ready.then(sw=>sw.sync.register('laasya-sync'));
     }
   }
 }
@@ -1644,13 +1672,7 @@ async function importStudentsFromSheet(){
   const el=document.getElementById('syncStat');
   if(el) el.textContent='Importing students...';
   try{
-    const pullUrl=sheetUrl+(sheetUrl.includes('?')?'&':'?')+'payload='+encodeURIComponent(JSON.stringify({action:'getStudents'}));
-    const controller=new AbortController();
-    const timeoutId=setTimeout(()=>controller.abort(),10000);
-    const r=await fetch(pullUrl,{method:'GET',signal:controller.signal});
-    clearTimeout(timeoutId);
-    if(!r.ok) throw new Error('Sheet not reachable');
-    const j=await r.json();
+    const j=await sheetGet('getStudents', 12000);
     if(j.status!=='ok'||!j.rows) throw new Error(j.message||'No data found');
 
     // j.rows: array of {id, name, phone, dob, batchId, notes, archived}
@@ -1696,6 +1718,42 @@ async function importStudentsFromSheet(){
   }
 }
 
+// ── Load from Sheet on startup (tries pullSheets tabs first, then _json) ──
+async function tryLoadFromSheet(btn){
+  const applyData = (data) => {
+    db = data;
+    if(!db.meta) db.meta={};
+    db.meta.lastSync = new Date().toISOString();
+    localStorage.setItem(STORE, JSON.stringify(db));
+    navigate('Batches'); updateHeader();
+    if(btn){
+      btn.innerHTML='✓ Loaded'; btn.className='hbtn synced';
+      setTimeout(()=>{ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }, 3000);
+    }
+    toast('Data loaded from Google Sheets ✓');
+    return true;
+  };
+
+  // Attempt 1: Read directly from Batches/Students/Payments tabs
+  try{
+    const j = await sheetGet('pullSheets', 12000);
+    if(j.status==='ok' && j.data && j.data.batches && j.data.batches.length>0){
+      return applyData(j.data);
+    }
+  }catch(e){ console.log('pullSheets failed:', e.message); }
+
+  // Attempt 2: Read from _json snapshot (written by previous syncs)
+  try{
+    const j = await sheetGet('pull', 10000);
+    if(j.status==='ok' && j.data && j.data.batches && j.data.batches.length>0){
+      return applyData(j.data);
+    }
+  }catch(e){ console.log('pull failed:', e.message); }
+
+  toast('Could not load from Sheet. Check internet and try again.');
+  return false;
+}
+
 function confirmForcePush(){
   if(!isLocalNonEmpty()){
     toast('No local data to push. Restore from backup first.');
@@ -1712,240 +1770,215 @@ function openSheetSetup(){
 }
 function openGuide(){ document.getElementById('modalGuide').classList.add('open'); }
 function copyScript(){
-  var s='';
-  s+="// Laasya School of Dance - Apps Script\n";
-  s+="// Paste this in Apps Script editor, then Deploy > New deployment > Web app > Anyone\n\n";
-  s+="var SPREADSHEET_ID = SpreadsheetApp.getActiveSpreadsheet().getId();\n\n";
-  s+="function doGet(e){\n";
-  s+="  try{\n";
-  s+="    if(!e.parameter.payload) return out({status:'error',message:'No payload'});\n";
-  s+="    var b=JSON.parse(decodeURIComponent(e.parameter.payload));\n";
-  s+="    if(b.action==='sync') return syncData(b.data);\n";
-  s+="    if(b.action==='pull') return pullData();\n";
-  s+="    if(b.action==='pullSheets') return pullFromSheets();\n";
-  s+="    if(b.action==='getStudents') return getStudentsData();\n";
-  s+="    return out({status:'error',message:'Unknown action'});\n";
-  s+="  }catch(err){ return out({status:'error',message:err.message}); }\n";
-  s+="}\n\n";
-  s+="function doPost(e){\n";
-  s+="  try{\n";
-  s+="    var b=JSON.parse(e.postData.contents);\n";
-  s+="    if(b.action==='sync') return syncData(b.data);\n";
-  s+="    if(b.action==='pull') return pullData();\n";
-  s+="    if(b.action==='pullSheets') return pullFromSheets();\n";
-  s+="    if(b.action==='getStudents') return getStudentsData();\n";
-  s+="    return out({status:'error',message:'Unknown'});\n";
-  s+="  }catch(err){ return out({status:'error',message:err.message}); }\n";
-  s+="}\n\n";
-  s+="function getStudentsData(){\n";
-  s+="  var ss=SpreadsheetApp.getActiveSpreadsheet();\n";
-  s+="  var sh=ss.getSheetByName('Students');\n";
-  s+="  if(!sh) return out({status:'error',message:'No Students sheet found'});\n";
-  s+="  var data=sh.getDataRange().getValues();\n";
-  s+="  if(data.length<2) return out({status:'ok',rows:[]});\n";
-  s+="  var header=data[0];\n";
-  s+="  var idCol=header.indexOf('Student ID');\n";
-  s+="  var nameCol=header.indexOf('Student Name');\n";
-  s+="  var phoneCol=header.indexOf('Phone');\n";
-  s+="  var dobCol=header.indexOf('Date of Birth');\n";
-  s+="  var batchCol=header.indexOf('Batch ID');\n";
-  s+="  var notesCol=header.indexOf('Notes');\n";
-  s+="  var archCol=header.indexOf('Archived');\n";
-  s+="  var rows=[];\n";
-  s+="  for(var i=1;i<data.length;i++){\n";
-  s+="    var row=data[i];\n";
-  s+="    if(!row[idCol]) continue;\n";
-  s+="    rows.push({\n";
-  s+="      id:String(row[idCol]).trim(),\n";
-  s+="      name:nameCol>=0?String(row[nameCol]||''):'',\n";
-  s+="      phone:phoneCol>=0?String(row[phoneCol]||''):'',\n";
-  s+="      dob:dobCol>=0?formatDobValue(row[dobCol]):'',\n";
-  s+="      batchId:batchCol>=0?String(row[batchCol]||'').trim():'',\n";
-  s+="      notes:notesCol>=0?String(row[notesCol]||''):'',\n";
-  s+="      archived:archCol>=0?String(row[archCol]||''):''\n";
-  s+="    });\n";
-  s+="  }\n";
-  s+="  return out({status:'ok',rows:rows});\n";
-  s+="}\n\n";
-  s+="// Read directly from Batches + Students tabs (human-readable) and rebuild db\n";
-  s+="function pullFromSheets(){\n";
-  s+="  var ss=SpreadsheetApp.getActiveSpreadsheet();\n";
-  s+="  var data={batches:[],students:[],classes:[],payments:[],meta:{lastSync:new Date().toISOString()}};\n";
-  s+="  // Read Batches tab\n";
-  s+="  var bsh=ss.getSheetByName('Batches');\n";
-  s+="  if(bsh&&bsh.getLastRow()>1){\n";
-  s+="    var bdata=bsh.getDataRange().getValues();\n";
-  s+="    var bh=bdata[0]; // header row\n";
-  s+="    var biId=bh.indexOf('Batch ID'), biName=bh.indexOf('Batch Name');\n";
-  s+="    var biTime=bh.indexOf('Timing'), biFee=bh.indexOf('Monthly Fee (Rs)');\n";
-  s+="    var biColor=bh.indexOf('Color'), biNotes=bh.indexOf('Notes');\n";
-  s+="    for(var i=1;i<bdata.length;i++){\n";
-  s+="      var row=bdata[i];\n";
-  s+="      var bid=biId>=0?String(row[biId]||'').trim():'';\n";
-  s+="      var bname=biName>=0?String(row[biName]||'').trim():'';\n";
-  s+="      if(!bid||!bname) continue;\n";
-  s+="      data.batches.push({\n";
-  s+="        id:bid, name:bname,\n";
-  s+="        time:biTime>=0?String(row[biTime]||''):'',\n";
-  s+="        fee:biFee>=0?Number(row[biFee])||0:0,\n";
-  s+="        color:biColor>=0?String(row[biColor]||''):'#333',\n";
-  s+="        notes:biNotes>=0?String(row[biNotes]||''):''\n";
-  s+="      });\n";
-  s+="    }\n";
-  s+="  }\n";
-  s+="  // Read Students tab\n";
-  s+="  var ssh=ss.getSheetByName('Students');\n";
-  s+="  if(ssh&&ssh.getLastRow()>1){\n";
-  s+="    var sdata=ssh.getDataRange().getValues();\n";
-  s+="    var sh=sdata[0];\n";
-  s+="    var siId=sh.indexOf('Student ID'), siName=sh.indexOf('Student Name');\n";
-  s+="    var siPhone=sh.indexOf('Phone'), siDob=sh.indexOf('Date of Birth');\n";
-  s+="    var siBatch=sh.indexOf('Batch ID'), siNotes=sh.indexOf('Notes');\n";
-  s+="    var siArch=sh.indexOf('Archived');\n";
-  s+="    for(var i=1;i<sdata.length;i++){\n";
-  s+="      var row=sdata[i];\n";
-  s+="      var sid=siId>=0?String(row[siId]||'').trim():'';\n";
-  s+="      var sname=siName>=0?String(row[siName]||'').trim():'';\n";
-  s+="      if(!sid||!sname) continue;\n";
-  s+="      data.students.push({\n";
-  s+="        id:sid, name:sname,\n";
-  s+="        phone:siPhone>=0?String(row[siPhone]||''):'',\n";
-  s+="        dob:siDob>=0?formatDobValue(row[siDob]):'',\n";
-  s+="        batchId:siBatch>=0?String(row[siBatch]||'').trim():'',\n";
-  s+="        notes:siNotes>=0?String(row[siNotes]||''):'',\n";
-  s+="        archived:/^(yes|true|1)$/i.test(String(row[siArch]||''))\n";
-  s+="      });\n";
-  s+="    }\n";
-  s+="  }\n";
-  s+="  // Read Payments tab\n";
-  s+="  var psh=ss.getSheetByName('Payments');\n";
-  s+="  if(psh&&psh.getLastRow()>1){\n";
-  s+="    var pdata=psh.getDataRange().getValues();\n";
-  s+="    var ph=pdata[0];\n";
-  s+="    var piId=ph.indexOf('Payment ID'), piSid=ph.indexOf('Student ID');\n";
-  s+="    var piMo=ph.indexOf('Month'), piAmt=ph.indexOf('Amount (Rs)');\n";
-  s+="    var piDate=ph.indexOf('Date'), piMode=ph.indexOf('Mode');\n";
-  s+="    for(var i=1;i<pdata.length;i++){\n";
-  s+="      var row=pdata[i];\n";
-  s+="      var pid=piId>=0?String(row[piId]||'').trim():'';\n";
-  s+="      var psid=piSid>=0?String(row[piSid]||'').trim():'';\n";
-  s+="      if(!pid||!psid) continue;\n";
-  s+="      data.payments.push({\n";
-  s+="        id:pid, studentId:psid,\n";
-  s+="        month:piMo>=0?String(row[piMo]||''):'',\n";
-  s+="        amount:piAmt>=0?Number(row[piAmt])||0:0,\n";
-  s+="        date:piDate>=0?String(row[piDate]||''):'',\n";
-  s+="        note:piMode>=0?String(row[piMode]||''):''\n";
-  s+="      });\n";
-  s+="    }\n";
-  s+="  }\n";
-  s+="  if(data.batches.length===0&&data.students.length===0){\n";
-  s+="    return out({status:'ok',data:data,message:'Sheets appear empty'});\n";
-  s+="  }\n";
-  s+="  return out({status:'ok',data:data});\n";
-  s+="}\n\n";
-  s+="function formatDobValue(v){\n";
-  s+="  if(!v) return '';\n";
-  s+="  if(Object.prototype.toString.call(v)==='[object Date]'){\n";
-  s+="    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');\n";
-  s+="  }\n";
-  s+="  return String(v);\n";
-  s+="}\n\n";
-  s+="function syncData(data){\n";
-  s+="  var ss=SpreadsheetApp.getActiveSpreadsheet();\n";
-  s+="  // Build lookup maps for human-readable names\n";
-  s+="  var batchMap={}; // id -> name\n";
-  s+="  (data.batches||[]).forEach(function(b){ batchMap[b.id]=b.name; });\n";
-  s+="  var studentMap={}; // id -> name\n";
-  s+="  (data.students||[]).forEach(function(s){ studentMap[s.id]=s.name; });\n\n";
-  s+="  // Batches sheet\n";
-  s+="  var bsh=ss.getSheetByName('Batches')||ss.insertSheet('Batches');\n";
-  s+="  bsh.clearContents();\n";
-  s+="  bsh.appendRow(['Batch ID','Batch Name','Timing','Monthly Fee (Rs)','Color','Notes']);\n";
-  s+="  (data.batches||[]).forEach(function(b){\n";
-  s+="    bsh.appendRow([b.id,b.name,b.time||'',b.fee||0,b.color||'',b.notes||'']);\n";
-  s+="  });\n\n";
-  s+="  // Students sheet\n";
-  s+="  var ssh=ss.getSheetByName('Students')||ss.insertSheet('Students');\n";
-  s+="  ssh.clearContents();\n";
-  s+="  ssh.appendRow(['Student ID','Student Name','Phone','Date of Birth','Batch ID','Notes','Archived']);\n";
-  s+="  (data.students||[]).forEach(function(s){\n";
-  s+="    ssh.appendRow([s.id,s.name,s.phone||'',s.dob||'',s.batchId||'',s.notes||'',s.archived?'Yes':'No']);\n";
-  s+="  });\n\n";
-  s+="  // Classes sheet\n";
-  s+="  var csh=ss.getSheetByName('Classes')||ss.insertSheet('Classes');\n";
-  s+="  csh.clearContents();\n";
-  s+="  csh.appendRow(['Class ID','Date','Batch IDs','Present Count','Absent Count','Attendance Detail']);\n";
-  s+="  (data.classes||[]).forEach(function(cl){\n";
-  s+="    var att=cl.attendance||{};\n";
-  s+="    var present=[],absent=[];\n";
-  s+="    Object.entries(att).forEach(function(e){\n";
-  s+="      var sname=studentMap[e[0]]||e[0];\n";
-  s+="      if(e[1]==='present') present.push(sname);\n";
-  s+="      else if(e[1]==='absent') absent.push(sname);\n";
-  s+="    });\n";
-  s+="    var detail='Present: '+present.join(', ')+(absent.length?' | Absent: '+absent.join(', '):'');\n";
-  s+="    csh.appendRow([cl.id,cl.date,(cl.batches||[]).join(', '),present.length,absent.length,detail]);\n";
-  s+="  });\n\n";
-  s+="  // Payments sheet\n";
-  s+="  var psh=ss.getSheetByName('Payments')||ss.insertSheet('Payments');\n";
-  s+="  psh.clearContents();\n";
-  s+="  psh.appendRow(['Payment ID','Student ID','Student Name','Month','Amount (Rs)','Date','Mode']);\n";
-  s+="  (data.payments||[]).forEach(function(p){\n";
-  s+="    psh.appendRow([p.id,p.studentId,studentMap[p.studentId]||'',p.month,p.amount||0,p.date||'',p.note||'Cash']);\n";
-  s+="  });\n\n";
-  s+="  // Fee Summary sheet\n";
-  s+="  var fsh=ss.getSheetByName('Fee Summary')||ss.insertSheet('Fee Summary');\n";
-  s+="  fsh.clearContents();\n";
-  s+="  fsh.appendRow(['Student ID','Student Name','Batch Name','Month','Fee Due (Rs)','Paid (Rs)','Balance (Rs)','Status']);\n";
-  s+="  // Build per-student per-month summary\n";
-  s+="  var monthMap={};\n";
-  s+="  (data.classes||[]).forEach(function(cl){\n";
-  s+="    var mk=cl.date.slice(0,7);\n";
-  s+="    (cl.batches||[]).forEach(function(bid){\n";
-  s+="      if(!monthMap[mk]) monthMap[mk]={};\n";
-  s+="      if(!monthMap[mk][bid]) monthMap[mk][bid]=[];\n";
-  s+="      monthMap[mk][bid].push(cl);\n";
-  s+="    });\n";
-  s+="  });\n";
-  s+="  var payMap={};\n";
-  s+="  (data.payments||[]).forEach(function(p){ var k=p.studentId+'_'+p.month; payMap[k]=(payMap[k]||0)+p.amount; });\n";
-  s+="  var batchFeeMap={};\n";
-  s+="  (data.batches||[]).forEach(function(b){ batchFeeMap[b.id]=b.fee||0; });\n";
-  s+="  (data.students||[]).forEach(function(s){\n";
-  s+="    var bname=batchMap[s.batchId]||'';\n";
-  s+="    Object.keys(monthMap).sort().forEach(function(mk){\n";
-  s+="      var classes=monthMap[mk][s.batchId]||[];\n";
-  s+="      if(!classes.length) return;\n";
-  s+="      var att=classes.some(function(cl){ return (cl.attendance||{})[s.id]==='present'; });\n";
-  s+="      var due=att?(batchFeeMap[s.batchId]||0):0;\n";
-  s+="      var paid=payMap[s.id+'_'+mk]||0;\n";
-  s+="      var balance=due-paid;\n";
-  s+="      var status=due===0?'No class':paid>=due?'Paid':paid>0?'Partial':'Pending';\n";
-  s+="      fsh.appendRow([s.id,s.name,bname,mk,due,paid,balance,status]);\n";
-  s+="    });\n";
-  s+="  });\n\n";
-  s+="  // Store full JSON for pull-back\n";
-  s+="  var jsh=ss.getSheetByName('_json')||ss.insertSheet('_json');\n";
-  s+="  jsh.hideSheet();\n";
-  s+="  jsh.clearContents();\n";
-  s+="  jsh.getRange(1,1).setValue(JSON.stringify({status:'ok',data:data,lastSync:new Date().toISOString()}));\n";
-  s+="  return out({status:'ok'});\n";
-  s+="}\n\n";
-  s+="function pullData(){\n";
-  s+="  var ss=SpreadsheetApp.getActiveSpreadsheet();\n";
-  s+="  var sh=ss.getSheetByName('_json');\n";
-  s+="  if(!sh) return out({status:'error',message:'No data synced yet. Open the app and tap Sync first.'});\n";
-  s+="  var raw=sh.getRange(1,1).getValue();\n";
-  s+="  if(!raw) return out({status:'error',message:'Empty'});\n";
-  s+="  return ContentService.createTextOutput(raw).setMimeType(ContentService.MimeType.JSON);\n";
-  s+="}\n\n";
-  s+="function out(o){\n";
-  s+="  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);\n";
-  s+="}\n";
-  navigator.clipboard.writeText(s)
-    .then(function(){ toast('Script copied! Paste in Apps Script then redeploy (new version).'); })
-    .catch(function(){ toast('Could not auto-copy. Open Setup guide and copy manually.'); });
+  var lines = [];
+  lines.push("// Laasya School of Dance - Apps Script");
+  lines.push("// Steps: Extensions > Apps Script > paste this > Deploy > New deployment");
+  lines.push("//        Web app, Execute as: Me, Who has access: Anyone > Deploy > Copy URL");
+  lines.push("");
+  lines.push("function doGet(e){");
+  lines.push("  try{");
+  lines.push("    var raw=e.parameter.payload;");
+  lines.push("    if(!raw) return out({status:'error',message:'No payload'});");
+  lines.push("    var b=JSON.parse(decodeURIComponent(raw));");
+  lines.push("    if(b.action==='pull') return pullFromJsonSheet();");
+  lines.push("    if(b.action==='pullSheets') return pullFromSheets();");
+  lines.push("    if(b.action==='getStudents') return getStudentsData();");
+  lines.push("    return out({status:'error',message:'Unknown: '+b.action});");
+  lines.push("  }catch(err){ return out({status:'error',message:err.message}); }");
+  lines.push("}");
+  lines.push("");
+  lines.push("function doPost(e){");
+  lines.push("  try{");
+  lines.push("    var b=JSON.parse(e.postData.contents);");
+  lines.push("    if(b.action==='sync') return syncData(b.data);");
+  lines.push("    return out({status:'error',message:'Unknown POST action: '+b.action});");
+  lines.push("  }catch(err){ return out({status:'error',message:err.message}); }");
+  lines.push("}");
+  lines.push("");
+  lines.push("// ── SYNC: write all data from app to Sheet ──────────────────");
+  lines.push("function syncData(data){");
+  lines.push("  var ss=SpreadsheetApp.getActiveSpreadsheet();");
+  lines.push("  var batchMap={}, studentMap={};");
+  lines.push("  (data.batches||[]).forEach(function(b){ batchMap[b.id]=b.name; });");
+  lines.push("  (data.students||[]).forEach(function(s){ studentMap[s.id]=s.name; });");
+  lines.push("  // Batches sheet");
+  lines.push("  wr(ss,'Batches',data.batches||[],");
+  lines.push("    ['Batch ID','Batch Name','Timing','Monthly Fee (Rs)','Color','Notes'],");
+  lines.push("    function(b){ return [b.id,b.name,b.time||'',b.fee||0,b.color||'',b.notes||'']; });");
+  lines.push("  // Students sheet");
+  lines.push("  wr(ss,'Students',data.students||[],");
+  lines.push("    ['Student ID','Student Name','Phone','Date of Birth','Batch ID','Notes','Archived'],");
+  lines.push("    function(s){ return [s.id,s.name,s.phone||'',s.dob||'',s.batchId||'',s.notes||'',s.archived?'Yes':'No']; });");
+  lines.push("  // Classes sheet");
+  lines.push("  var csh=ss.getSheetByName('Classes')||ss.insertSheet('Classes');");
+  lines.push("  csh.clearContents();");
+  lines.push("  csh.appendRow(['Class ID','Date','Batch IDs','Present Count','Absent Count','Attendance Detail']);");
+  lines.push("  (data.classes||[]).forEach(function(cl){");
+  lines.push("    var att=cl.attendance||{}, present=[], absent=[];");
+  lines.push("    Object.entries(att).forEach(function(e){");
+  lines.push("      var nm=studentMap[e[0]]||e[0];");
+  lines.push("      if(e[1]==='present') present.push(nm); else if(e[1]==='absent') absent.push(nm);");
+  lines.push("    });");
+  lines.push("    csh.appendRow([cl.id,cl.date,(cl.batches||[]).join(', '),present.length,absent.length,");
+  lines.push("      'Present: '+present.join(', ')+(absent.length?' | Absent: '+absent.join(', '):'')]);");
+  lines.push("  });");
+  lines.push("  // Payments sheet");
+  lines.push("  wr(ss,'Payments',data.payments||[],");
+  lines.push("    ['Payment ID','Student ID','Student Name','Month','Amount (Rs)','Date','Mode'],");
+  lines.push("    function(p){ return [p.id,p.studentId,studentMap[p.studentId]||'',p.month,p.amount||0,p.date||'',p.note||'Cash']; });");
+  lines.push("  // Fee Summary sheet");
+  lines.push("  var fsh=ss.getSheetByName('Fee Summary')||ss.insertSheet('Fee Summary');");
+  lines.push("  fsh.clearContents();");
+  lines.push("  fsh.appendRow(['Student ID','Student Name','Batch Name','Month','Fee Due (Rs)','Paid (Rs)','Balance (Rs)','Status']);");
+  lines.push("  var bFeeMap={};");
+  lines.push("  (data.batches||[]).forEach(function(b){ bFeeMap[b.id]=b.fee||0; });");
+  lines.push("  var monthClasses={};");
+  lines.push("  (data.classes||[]).forEach(function(cl){");
+  lines.push("    var mk=cl.date.slice(0,7);");
+  lines.push("    (cl.batches||[]).forEach(function(bid){");
+  lines.push("      if(!monthClasses[mk]) monthClasses[mk]={};");
+  lines.push("      if(!monthClasses[mk][bid]) monthClasses[mk][bid]=[];");
+  lines.push("      monthClasses[mk][bid].push(cl);");
+  lines.push("    });");
+  lines.push("  });");
+  lines.push("  var payMap={};");
+  lines.push("  (data.payments||[]).forEach(function(p){ var k=p.studentId+'_'+p.month; payMap[k]=(payMap[k]||0)+p.amount; });");
+  lines.push("  (data.students||[]).forEach(function(s){");
+  lines.push("    var bname=batchMap[s.batchId]||'';");
+  lines.push("    Object.keys(monthClasses).sort().forEach(function(mk){");
+  lines.push("      var classes=monthClasses[mk][s.batchId]||[];");
+  lines.push("      if(!classes.length) return;");
+  lines.push("      var att=classes.some(function(cl){ return (cl.attendance||{})[s.id]==='present'; });");
+  lines.push("      var due=att?(bFeeMap[s.batchId]||0):0;");
+  lines.push("      var paid=payMap[s.id+'_'+mk]||0;");
+  lines.push("      var status=due===0?'No class':paid>=due?'Paid':paid>0?'Partial':'Pending';");
+  lines.push("      fsh.appendRow([s.id,s.name,bname,mk,due,paid,due-paid,status]);");
+  lines.push("    });");
+  lines.push("  });");
+  lines.push("  // _json hidden sheet for pull-back");
+  lines.push("  var jsh=ss.getSheetByName('_json')||ss.insertSheet('_json');");
+  lines.push("  try{ jsh.hideSheet(); }catch(e){}");
+  lines.push("  jsh.clearContents();");
+  lines.push("  jsh.getRange(1,1).setValue(JSON.stringify({status:'ok',data:data,lastSync:new Date().toISOString()}));");
+  lines.push("  return out({status:'ok',synced:new Date().toISOString()});");
+  lines.push("}");
+  lines.push("");
+  lines.push("// ── PULL: read _json snapshot written by syncData ────────────");
+  lines.push("function pullFromJsonSheet(){");
+  lines.push("  var ss=SpreadsheetApp.getActiveSpreadsheet();");
+  lines.push("  var sh=ss.getSheetByName('_json');");
+  lines.push("  if(!sh||sh.getLastRow()<1) return out({status:'ok',data:{batches:[],students:[],classes:[],payments:[]}});");
+  lines.push("  var raw=sh.getRange(1,1).getValue();");
+  lines.push("  if(!raw) return out({status:'ok',data:{batches:[],students:[],classes:[],payments:[]}});");
+  lines.push("  return ContentService.createTextOutput(raw).setMimeType(ContentService.MimeType.JSON);");
+  lines.push("}");
+  lines.push("");
+  lines.push("// ── PULLSHEETS: read Batches+Students tabs directly ──────────");
+  lines.push("function pullFromSheets(){");
+  lines.push("  var ss=SpreadsheetApp.getActiveSpreadsheet();");
+  lines.push("  var data={batches:[],students:[],classes:[],payments:[],meta:{lastSync:new Date().toISOString()}};");
+  lines.push("  var bsh=ss.getSheetByName('Batches');");
+  lines.push("  if(bsh&&bsh.getLastRow()>1){");
+  lines.push("    var rows=bsh.getDataRange().getValues(), h=rows[0];");
+  lines.push("    var iId=h.indexOf('Batch ID'), iName=h.indexOf('Batch Name');");
+  lines.push("    var iTime=h.indexOf('Timing'), iFee=h.indexOf('Monthly Fee (Rs)');");
+  lines.push("    var iColor=h.indexOf('Color'), iNotes=h.indexOf('Notes');");
+  lines.push("    for(var i=1;i<rows.length;i++){");
+  lines.push("      var r=rows[i];");
+  lines.push("      var id=iId>=0?String(r[iId]||'').trim():'';");
+  lines.push("      var nm=iName>=0?String(r[iName]||'').trim():'';");
+  lines.push("      if(!id||!nm) continue;");
+  lines.push("      data.batches.push({id:id,name:nm,");
+  lines.push("        time:iTime>=0?String(r[iTime]||''):'',");
+  lines.push("        fee:iFee>=0?Number(r[iFee])||0:0,");
+  lines.push("        color:iColor>=0&&r[iColor]?String(r[iColor]):'#e74c3c',");
+  lines.push("        notes:iNotes>=0?String(r[iNotes]||''):''});");
+  lines.push("    }");
+  lines.push("  }");
+  lines.push("  var ssh=ss.getSheetByName('Students');");
+  lines.push("  if(ssh&&ssh.getLastRow()>1){");
+  lines.push("    var rows=ssh.getDataRange().getValues(), h=rows[0];");
+  lines.push("    var iId=h.indexOf('Student ID'), iName=h.indexOf('Student Name');");
+  lines.push("    var iPhone=h.indexOf('Phone'), iDob=h.indexOf('Date of Birth');");
+  lines.push("    var iBatch=h.indexOf('Batch ID'), iNotes=h.indexOf('Notes'), iArch=h.indexOf('Archived');");
+  lines.push("    for(var i=1;i<rows.length;i++){");
+  lines.push("      var r=rows[i];");
+  lines.push("      var id=iId>=0?String(r[iId]||'').trim():'';");
+  lines.push("      var nm=iName>=0?String(r[iName]||'').trim():'';");
+  lines.push("      if(!id||!nm) continue;");
+  lines.push("      data.students.push({id:id,name:nm,");
+  lines.push("        phone:iPhone>=0?String(r[iPhone]||''):'',");
+  lines.push("        dob:iDob>=0?fmtDate(r[iDob]):'',");
+  lines.push("        batchId:iBatch>=0?String(r[iBatch]||'').trim():'',");
+  lines.push("        notes:iNotes>=0?String(r[iNotes]||''):'',");
+  lines.push("        archived:iArch>=0?/^(yes|true|1)$/i.test(String(r[iArch]||'')):false});");
+  lines.push("    }");
+  lines.push("  }");
+  lines.push("  var psh=ss.getSheetByName('Payments');");
+  lines.push("  if(psh&&psh.getLastRow()>1){");
+  lines.push("    var rows=psh.getDataRange().getValues(), h=rows[0];");
+  lines.push("    var iId=h.indexOf('Payment ID'), iSid=h.indexOf('Student ID');");
+  lines.push("    var iMo=h.indexOf('Month'), iAmt=h.indexOf('Amount (Rs)');");
+  lines.push("    var iDate=h.indexOf('Date'), iMode=h.indexOf('Mode');");
+  lines.push("    for(var i=1;i<rows.length;i++){");
+  lines.push("      var r=rows[i];");
+  lines.push("      var id=iId>=0?String(r[iId]||'').trim():'';");
+  lines.push("      var sid=iSid>=0?String(r[iSid]||'').trim():'';");
+  lines.push("      if(!id||!sid) continue;");
+  lines.push("      data.payments.push({id:id,studentId:sid,");
+  lines.push("        month:iMo>=0?String(r[iMo]||''):'',");
+  lines.push("        amount:iAmt>=0?Number(r[iAmt])||0:0,");
+  lines.push("        date:iDate>=0?String(r[iDate]||''):'',");
+  lines.push("        note:iMode>=0?String(r[iMode]||''):''});");
+  lines.push("    }");
+  lines.push("  }");
+  lines.push("  return out({status:'ok',data:data});");
+  lines.push("}");
+  lines.push("");
+  lines.push("// ── GETSTUDENTS: for import-students feature ─────────────────");
+  lines.push("function getStudentsData(){");
+  lines.push("  var ss=SpreadsheetApp.getActiveSpreadsheet();");
+  lines.push("  var sh=ss.getSheetByName('Students');");
+  lines.push("  if(!sh||sh.getLastRow()<2) return out({status:'ok',rows:[]});");
+  lines.push("  var rows=sh.getDataRange().getValues(), h=rows[0], result=[];");
+  lines.push("  var iId=h.indexOf('Student ID'), iName=h.indexOf('Student Name');");
+  lines.push("  var iPhone=h.indexOf('Phone'), iDob=h.indexOf('Date of Birth');");
+  lines.push("  var iBatch=h.indexOf('Batch ID'), iNotes=h.indexOf('Notes'), iArch=h.indexOf('Archived');");
+  lines.push("  for(var i=1;i<rows.length;i++){");
+  lines.push("    var r=rows[i];");
+  lines.push("    var id=iId>=0?String(r[iId]||'').trim():''; if(!id) continue;");
+  lines.push("    result.push({id:id,");
+  lines.push("      name:iName>=0?String(r[iName]||''):'',");
+  lines.push("      phone:iPhone>=0?String(r[iPhone]||''):'',");
+  lines.push("      dob:iDob>=0?fmtDate(r[iDob]):'',");
+  lines.push("      batchId:iBatch>=0?String(r[iBatch]||'').trim():'',");
+  lines.push("      notes:iNotes>=0?String(r[iNotes]||''):'',");
+  lines.push("      archived:iArch>=0?String(r[iArch]||''):''});");
+  lines.push("  }");
+  lines.push("  return out({status:'ok',rows:result});");
+  lines.push("}");
+  lines.push("");
+  lines.push("// ── HELPERS ──────────────────────────────────────────────────");
+  lines.push("function wr(ss,name,arr,cols,rowFn){");
+  lines.push("  var sh=ss.getSheetByName(name)||ss.insertSheet(name);");
+  lines.push("  sh.clearContents(); sh.appendRow(cols);");
+  lines.push("  arr.forEach(function(item){ sh.appendRow(rowFn(item)); });");
+  lines.push("}");
+  lines.push("function fmtDate(v){");
+  lines.push("  if(!v) return '';");
+  lines.push("  if(Object.prototype.toString.call(v)==='[object Date]')");
+  lines.push("    return Utilities.formatDate(v,Session.getScriptTimeZone(),'yyyy-MM-dd');");
+  lines.push("  return String(v);");
+  lines.push("}");
+  lines.push("function out(o){");
+  lines.push("  return ContentService.createTextOutput(JSON.stringify(o))");
+  lines.push("    .setMimeType(ContentService.MimeType.JSON);");
+  lines.push("}");
+
+  var script = lines.join('\n');
+  navigator.clipboard.writeText(script)
+    .then(function(){ toast('Script copied! Paste in Apps Script then redeploy as new version.'); })
+    .catch(function(){ toast('Copy failed - open Setup guide and copy manually'); });
 }
 
 function exportJSON(){
@@ -2048,53 +2081,10 @@ async function initApp(){
   if(!isLocalNonEmpty() && sheetUrl){
     const btn=document.getElementById('topSyncBtn');
     if(btn){ btn.style.display='flex'; btn.innerHTML='↻ Loading...'; btn.className='hbtn syncing'; }
-    toast('First launch - loading from Google Sheets...');
-    try{
-      // Step 1: Try reading directly from Batches + Students + Classes + Payments tabs
-      const pullUrl=sheetUrl+(sheetUrl.includes('?')?'&':'?')+
-        'payload='+encodeURIComponent(JSON.stringify({action:'pullSheets'}));
-      const controller=new AbortController();
-      setTimeout(()=>controller.abort(),10000);
-      const r=await fetch(pullUrl,{method:'GET',signal:controller.signal});
-      if(r.ok){
-        const j=await r.json();
-        if(j.status==='ok'&&j.data&&j.data.batches&&j.data.batches.length>0){
-          db=j.data;
-          if(!db.meta) db.meta={};
-          db.meta.lastSync=new Date().toISOString();
-          localStorage.setItem(STORE,JSON.stringify(db));
-          navigate('Batches'); updateHeader();
-          if(btn){ btn.innerHTML='✓ Loaded'; btn.className='hbtn synced';
-            setTimeout(()=>{ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; },3000); }
-          toast('Data loaded from Google Sheets ✓');
-        } else {
-          // Step 2: Fall back to _json snapshot
-          const pullUrl2=sheetUrl+(sheetUrl.includes('?')?'&':'?')+
-            'payload='+encodeURIComponent(JSON.stringify({action:'pull'}));
-          const r2=await fetch(pullUrl2,{method:'GET'});
-          if(r2.ok){
-            const j2=await r2.json();
-            if(j2.status==='ok'&&j2.data&&j2.data.batches&&j2.data.batches.length>0){
-              db=j2.data;
-              if(!db.meta) db.meta={};
-              db.meta.lastSync=new Date().toISOString();
-              localStorage.setItem(STORE,JSON.stringify(db));
-              navigate('Batches'); updateHeader();
-              if(btn){ btn.innerHTML='✓ Loaded'; btn.className='hbtn synced';
-                setTimeout(()=>{ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; },3000); }
-              toast('Data loaded from Google Sheets ✓');
-            } else {
-              if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
-              toast('Sheet has no data yet - add batches to get started');
-            }
-          } else {
-            if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
-          }
-        }
-      }
-    }catch(e){
+    toast('Loading from Google Sheets...');
+    const loaded = await tryLoadFromSheet(btn);
+    if(!loaded){
       if(btn){ btn.innerHTML='↑↓ Sync'; btn.className='hbtn'; }
-      toast('Offline - add data locally, will sync when online');
     }
     return;
   }
