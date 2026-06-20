@@ -1,7 +1,6 @@
-// Laasya School of Dance - Service Worker v7
-const CACHE_NAME = 'laasya-v7';
+// Laasya School of Dance - Service Worker v8
+const CACHE_NAME = 'laasya-v8';
 
-// Use relative URLs - works regardless of repo name or case
 const CACHE_FILES = [
   './',
   './index.html',
@@ -11,6 +10,7 @@ const CACHE_FILES = [
   './favicon.png'
 ];
 
+// Install: cache all app files
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME)
@@ -19,6 +19,7 @@ self.addEventListener('install', event => {
   );
 });
 
+// Activate: clear old caches
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
@@ -29,22 +30,19 @@ self.addEventListener('activate', event => {
   );
 });
 
+// Fetch: serve app files from cache, let Google API calls go straight to network
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
-  // Never intercept Google Apps Script
+  // Never intercept Google Apps Script - let it go direct to network
   if (url.hostname.includes('script.google.com')) {
-    event.respondWith(
-      fetch(event.request).catch(() =>
-        new Response(JSON.stringify({status:'offline'}), {
-          headers: {'Content-Type': 'application/json'}
-        })
-      )
-    );
+    event.respondWith(fetch(event.request).catch(() =>
+      new Response('{"status":"offline"}', {headers:{'Content-Type':'application/json'}})
+    ));
     return;
   }
 
-  // Cache first, network fallback
+  // App files: cache first, network fallback
   event.respondWith(
     caches.match(event.request).then(cached => {
       if (cached) return cached;
@@ -59,16 +57,5 @@ self.addEventListener('fetch', event => {
   );
 });
 
-self.addEventListener('sync', event => {
-  if (event.tag === 'laasya-sync') {
-    event.waitUntil(
-      self.clients.matchAll().then(clients =>
-        clients.forEach(c => c.postMessage({type: 'SYNC_NOW'}))
-      )
-    );
-  }
-});
-
-self.addEventListener('message', event => {
-  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
-});
+// NOTE: No background sync handler - it caused infinite retry loops.
+// Sync is handled by the app directly on user actions and 5s debounce after saves.

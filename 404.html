@@ -544,19 +544,26 @@ let db = (() => {
 })();
 let sheetUrl = localStorage.getItem('laasyaSheet')||'https://script.google.com/macros/s/AKfycbwqDZpOFzDTIvcp1ILnZ50vVaoFe8y1xfah6L5N8GxErpEZKWBEViM9Odha8ebSpK-u/exec';
 
+let _syncing = false; // guard: prevents sync loop
+
 function saveDB(){
   if(!db.meta) db.meta={};
   db.meta.localModified = new Date().toISOString();
   localStorage.setItem(STORE, JSON.stringify(db));
-  updateSyncBtn(false);
-  // Only auto-push if we have real data (never push empty db)
-  if(sheetUrl && isLocalNonEmpty()){
-    clearTimeout(saveDB._t);
-    saveDB._t = setTimeout(syncNow, 4000);
+  if(!_syncing){
+    updateSyncBtn(false);
+    if(sheetUrl && isLocalNonEmpty()){
+      clearTimeout(saveDB._t);
+      saveDB._t = setTimeout(syncNow, 5000); // 5s debounce
+    }
   }
 }
 function isLocalNonEmpty(){
   return db.batches.length > 0 || db.students.length > 0 || db.classes.length > 0;
+}
+// Save to localStorage only - no sync trigger, no dirty flag
+function saveLocalOnly(){
+  localStorage.setItem(STORE, JSON.stringify(db));
 }
 function updateSyncBtn(synced){
   const btn=document.getElementById('topSyncBtn');
@@ -1620,49 +1627,77 @@ async function sheetGet(action, timeoutMs=10000){
 }
 
 // Helper: POST request to Sheet (for large writes - sync)
+// Uses text/plain to avoid CORS preflight. Apps Script reads e.postData.contents fine.
+// We use no-cors so the browser doesn't block the response - we just trust it went through.
 async function sheetPost(action, data, timeoutMs=15000){
   const ctrl=new AbortController();
   const tid=setTimeout(()=>ctrl.abort(), timeoutMs);
   try{
+    // Try with-cors first (readable response = we know it succeeded)
     const r=await fetch(sheetUrl,{
       method:'POST',
       body:JSON.stringify({action, data}),
-      headers:{'Content-Type':'text/plain'}, // text/plain avoids CORS preflight
+      headers:{'Content-Type':'text/plain'},
       signal:ctrl.signal
     });
     clearTimeout(tid);
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return await r.json();
-  }catch(e){ clearTimeout(tid); throw e; }
+    // If CORS allows reading the response, check it
+    if(r.type !== 'opaque'){
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return await r.json();
+    }
+    // Opaque response = sent but can't read. Treat as success.
+    return {status:'ok'};
+  }catch(e){
+    clearTimeout(tid);
+    // If CORS blocked, try no-cors (fire and forget - can't read response)
+    if(e.name==='TypeError' || e.message.includes('CORS') || e.message.includes('Failed to fetch')){
+      const ctrl2=new AbortController();
+      const tid2=setTimeout(()=>ctrl2.abort(), timeoutMs);
+      try{
+        await fetch(sheetUrl,{
+          method:'POST',
+          body:JSON.stringify({action, data}),
+          headers:{'Content-Type':'text/plain'},
+          mode:'no-cors',
+          signal:ctrl2.signal
+        });
+        clearTimeout(tid2);
+        return {status:'ok'}; // assume sent
+      }catch(e2){ clearTimeout(tid2); throw e2; }
+    }
+    throw e;
+  }
 }
 
 async function syncNow(force){
   if(!sheetUrl) return;
-  if(!force && !isLocalNonEmpty()){
-    console.log('Sync skipped: local is empty');
-    return;
-  }
+  if(_syncing) return; // already syncing, skip
+  if(!force && !isLocalNonEmpty()) return;
+
+  _syncing = true;
+  clearTimeout(saveDB._t); // cancel any pending auto-sync
   const el=document.getElementById('syncStat');
   updateSyncBtn(null);
   if(el) el.textContent='Syncing...';
+
   try{
-    // Use POST for large data - avoids URL length limits
     await sheetPost('sync', db);
     if(!db.meta) db.meta={};
-    db.meta.lastSync=new Date().toISOString();
-    delete db.meta.localModified;
-    localStorage.setItem(STORE,JSON.stringify(db));
-    const t=new Date().toLocaleTimeString('en-IN');
+    db.meta.lastSync = new Date().toISOString();
+    delete db.meta.localModified; // clear dirty flag - successfully pushed
+    saveLocalOnly(); // save without triggering another sync
+    const t = new Date().toLocaleTimeString('en-IN');
     if(el) el.textContent='Pushed at '+t;
     updateSyncBtn(true);
     if(document.getElementById('setSync')) renderSettings();
-    toast('Synced to Google Sheets ✓');
   }catch(e){
-    if(el) el.textContent='Sync failed - will retry when online';
+    console.log('Sync failed:', e.message);
+    if(el) el.textContent='Offline - changes saved locally';
     updateSyncBtn(false);
-    if('serviceWorker' in navigator && 'SyncManager' in window){
-      navigator.serviceWorker.ready.then(sw=>sw.sync.register('laasya-sync'));
-    }
+    // No SyncManager - it causes retry loops. We rely on next user action or manual sync.
+  }finally{
+    _syncing = false;
   }
 }
 
@@ -1724,7 +1759,8 @@ async function tryLoadFromSheet(btn){
     db = data;
     if(!db.meta) db.meta={};
     db.meta.lastSync = new Date().toISOString();
-    localStorage.setItem(STORE, JSON.stringify(db));
+    delete db.meta.localModified; // freshly loaded from sheet - not dirty
+    saveLocalOnly(); // save without triggering a push
     navigate('Batches'); updateHeader();
     if(btn){
       btn.innerHTML='✓ Loaded'; btn.className='hbtn synced';
@@ -2089,38 +2125,34 @@ async function initApp(){
     return;
   }
 
-  // Local has data - check if there are unsynced changes (dirty flag)
+  // Local has data - check if there are unsynced offline changes
   if(isLocalNonEmpty() && sheetUrl && db.meta && db.meta.localModified){
-    // There were offline edits - push them now
-    clearTimeout(saveDB._t);
-    saveDB._t=setTimeout(syncNow, 2000);
-    toast('Back online - syncing your offline changes...');
+    // Show a sync button indicator but don't auto-push on startup
+    // User can tap Sync button to push their offline changes
+    updateSyncBtn(false);
+    const el=document.getElementById('syncStat');
+    if(el) el.textContent='Offline changes pending - tap Sync to push';
+    toast('You have unsynced changes - tap ↑↓ Sync to push to Sheet');
   }
 }
 
-// Listen for service worker sync trigger (back online after offline edits)
-if('serviceWorker' in navigator){
-  navigator.serviceWorker.addEventListener('message', event=>{
-    if(event.data && event.data.type==='SYNC_NOW' && isLocalNonEmpty()){
-      syncNow();
-    }
-  });
-}
 
-// Register service worker
+// ── Service Worker ────────────────────────────────────────────────────────
 if('serviceWorker' in navigator){
   navigator.serviceWorker.register('./sw.js').then(reg=>{
-    // Check for updates on load
     reg.addEventListener('updatefound',()=>{
-      const newWorker=reg.installing;
-      newWorker.addEventListener('statechange',()=>{
-        if(newWorker.state==='installed'&&navigator.serviceWorker.controller){
-          toast('App updated - changes will apply next time you open it');
+      const nw=reg.installing;
+      nw.addEventListener('statechange',()=>{
+        if(nw.state==='installed'&&navigator.serviceWorker.controller){
+          toast('App updated - reopen to get latest version');
         }
       });
     });
-  }).catch(e=>console.log('SW registration failed:',e));
+  }).catch(e=>console.log('SW failed:',e));
+  // Note: We don't respond to SW background sync messages
+  // because they can cause retry loops. Sync is user-triggered or on saveDB().
 }
+
 
 initApp();
 </script>
